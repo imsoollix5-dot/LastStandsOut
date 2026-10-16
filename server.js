@@ -87,10 +87,11 @@ function startMatch(room) {
   room.players.forEach((p, i) => { p.hp = 100; p.kills = 0; p.deaths = 0; p.x = spawns[i].x; p.y = spawns[i].y; p.angle = spawns[i].angle; p.ammo = 30; p.socket.emit('matchStart', { roomCode: room.code, ranked: room.ranked, map: room.map, duration: 300, endsAt: room.endsAt, you: p.id, spawn: spawns[i], players: room.players.map(publicPlayer) }); });
   io.to(room.code).emit('matchState', room.players.map(publicPlayer));
   room.timer = setTimeout(() => finishMatch(room, 'time'), MATCH_MS);
+  room.syncTimer = setInterval(() => { if (room.status !== 'playing') { clearInterval(room.syncTimer); return; } const remaining = Math.max(0, Math.ceil((room.endsAt - Date.now()) / 1000)); io.to(room.code).emit('timerSync', { remaining, endsAt: room.endsAt }); if (remaining <= 0) clearInterval(room.syncTimer); }, 1000);
 }
 async function finishMatch(room, reason = 'time', disconnectedId = null) {
   if (!room || room.status !== 'playing') return;
-  room.status = 'finished'; if (room.timer) clearTimeout(room.timer);
+  room.status = 'finished'; if (room.timer) clearTimeout(room.timer); if (room.syncTimer) clearInterval(room.syncTimer);
   const [a,b] = room.players; if (!a || !b) { rooms.delete(room.code); return; }
   let winner = null;
   if (disconnectedId) winner = room.players.find(p => p.id !== disconnectedId) || null;
@@ -141,7 +142,7 @@ io.on('connection', socket => {
     p.color = safeColor(data?.color); p.roomCode = room.code; p.socket.join(room.code); room.players.push(p);
     io.to(room.code).emit('privateRoomUpdate', { roomCode: room.code, waiting: false, message: 'Opponent joined. Starting match…' }); startMatch(room);
   });
-  socket.on('fire', data => {
+  socket.on('fire', async data => {
     const room = rooms.get(p.roomCode); if (!room || room.status !== 'playing' || p.hp <= 0) return;
     const target = room.players.find(x => x.id !== p.id); if (!target || target.hp <= 0) return;
     const weapon = WEAPONS[data?.weapon] || WEAPONS.default; const angle = Number.isFinite(data?.angle) ? data.angle : p.angle;
@@ -152,7 +153,7 @@ io.on('connection', socket => {
     io.to(room.code).emit('shotFired', { shooter: p.id, x: p.x, y: p.y, angle, color: p.color, damage: weapon.damage });
     if (target.hp <= 0) {
       p.kills++; target.deaths++;
-      io.to(room.code).emit('playerKilled', { killer: p.id, killerName: p.name, victim: target.id, victimName: target.name, scores: room.players.map(x => ({ id: x.id, name: x.name, kills: x.kills, deaths: x.deaths })) });
+      let killerProfile = { name: p.name, role: 'MATCH OPPONENT', bio: 'This operator eliminated you.' }; try { const kp = await readProfile(p.userId); const gs = kp?.game_state || {}; killerProfile = { name: p.name, pfp: gs.profilePfpUrl || '', banner: gs.profileBannerUrl || '', bannerColor: gs.profileBannerColor || '#57212a', role: gs.equippedOperator || 'MATCH OPPONENT', bio: gs.operatorBio || 'This operator eliminated you.' }; } catch (_) {} io.to(room.code).emit('playerKilled', { killer: p.id, killerName: p.name, killerProfile, victim: target.id, victimName: target.name, scores: room.players.map(x => ({ id: x.id, name: x.name, kills: x.kills, deaths: x.deaths })) });
       target.socket.emit('playerRespawnSoon', { delay: 1800 });
       setTimeout(() => { if (rooms.get(room.code) !== room || room.status !== 'playing') return; target.hp = 100; target.x = room.map === 'tiny' ? (target.id === room.players[0].id ? 130 : 770) : (target.id === room.players[0].id ? 500 : 3100); target.y = room.map === 'tiny' ? 350 : 1300; target.socket.emit('playerRespawn', { x: target.x, y: target.y, hp: 100 }); io.to(room.code).emit('playerMoved', publicPlayer(target)); }, 1800);
     }
