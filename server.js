@@ -120,7 +120,7 @@ io.on('connection', socket => {
   socket.on('joinArena', data => { p.color = safeColor(data?.color); socket.emit('authenticated', { username: p.name }); });
   // Invite currently connected players by exact username. 1v1 invitations create a private room;
   // party invitations create a social lobby (party members can then coordinate before a match).
-  socket.on('inviteFriend', data => {
+  socket.on('inviteFriend', async data => {
     const targetName = safeText(data?.username, '', 18).toLowerCase();
     const kind = data?.kind === 'party' ? 'party' : 'duel';
     if (!targetName) return socket.emit('inviteError', 'Enter your friend’s username.');
@@ -128,7 +128,8 @@ io.on('connection', socket => {
     const target = [...players.values()].find(x => x.name.toLowerCase() === targetName);
     if (!target) return socket.emit('inviteError', 'That player is not connected to the online server right now. Ask them to connect first.');
     if (kind === 'duel') {
-      if (p.roomCode) return socket.emit('inviteError', 'Leave your current match or room before inviting someone to a 1v1.');
+      // Let players arrange a new duel from inside a match; the current match is recorded as a forfeit.
+      if (p.roomCode) { const currentRoom = rooms.get(p.roomCode); if (currentRoom) await finishMatch(currentRoom, 'forfeit', p.id); }
       const room = createRoom(p, data?.map, false);
       target.socket.emit('gameInvite', { kind, from: p.name, roomCode: room.code, map: room.map, inviteId: crypto.randomUUID() });
       socket.emit('inviteSent', { kind, username: target.name, roomCode: room.code, message: `1v1 invitation sent to ${target.name}. Waiting for them to accept.` });
@@ -141,12 +142,12 @@ io.on('connection', socket => {
       socket.emit('partyUpdate', { partyCode: party.code, host: party.hostName, members: [...party.members.values()] });
     }
   });
-  socket.on('acceptGameInvite', data => {
+  socket.on('acceptGameInvite', async data => {
     const kind = data?.kind === 'party' ? 'party' : 'duel';
     if (kind === 'duel') {
       const room = rooms.get(String(data?.roomCode || '').trim().toUpperCase());
       if (!room || room.ranked || room.status !== 'waiting') return socket.emit('inviteError', 'That 1v1 invitation has expired or the room is no longer available.');
-      if (p.roomCode) return socket.emit('inviteError', 'Leave your current room before accepting a 1v1 invitation.');
+      if (p.roomCode) { const currentRoom = rooms.get(p.roomCode); if (currentRoom) await finishMatch(currentRoom, 'forfeit', p.id); }
       if (room.players.length !== 1) return socket.emit('inviteError', 'That 1v1 room is full.');
       p.color = safeColor(data?.color); p.roomCode = room.code; p.socket.join(room.code); room.players.push(p);
       io.to(room.code).emit('privateRoomUpdate', { roomCode: room.code, waiting: false, message: 'Invitation accepted. Starting 1v1…' }); startMatch(room);
@@ -165,15 +166,15 @@ io.on('connection', socket => {
     const roomForMove = rooms.get(p.roomCode); const maxX = roomForMove?.map === 'tiny' ? 887 : 3587; const maxY = roomForMove?.map === 'tiny' ? 687 : 2587; p.x = clamp(data.x, 13, maxX); p.y = clamp(data.y, 13, maxY); p.angle = clamp(data.angle, -Math.PI * 100, Math.PI * 100);
     const room = rooms.get(p.roomCode); if (room?.status === 'playing') io.to(room.code).emit('playerMoved', publicPlayer(p));
   });
-  socket.on('joinRankedQueue', data => {
-    if (p.roomCode) return socket.emit('queueError', 'Leave your current room before joining matchmaking.');
+  socket.on('joinRankedQueue', async data => {
+    if (p.roomCode) { const currentRoom = rooms.get(p.roomCode); if (currentRoom) await finishMatch(currentRoom, 'forfeit', p.id); }
     removeFromQueue(p.id); p.color = safeColor(data?.color); p.queueMap = safeMap(data?.map);
     rankedQueue.push(p); socket.emit('queueStatus', { status: 'queued', message: 'Searching for an opponent…' });
     if (rankedQueue.length >= 2) { const first = rankedQueue.shift(), second = rankedQueue.shift(); if (first && second && first.id !== second.id) { const room = createRoom(first, first.queueMap, true); room.players.push(second); second.roomCode = room.code; second.socket.join(room.code); startMatch(room); } }
   });
   socket.on('leaveRankedQueue', () => { removeFromQueue(p.id); socket.emit('queueStatus', { status: 'left', message: 'Matchmaking cancelled.' }); });
-  socket.on('createPrivateRoom', data => {
-    if (p.roomCode) return socket.emit('queueError', 'Leave your current room first.');
+  socket.on('createPrivateRoom', async data => {
+    if (p.roomCode) { const currentRoom = rooms.get(p.roomCode); if (currentRoom) await finishMatch(currentRoom, 'forfeit', p.id); }
     p.color = safeColor(data?.color); const room = createRoom(p, data?.map, false);
     socket.emit('privateRoomCreated', { roomCode: room.code, map: room.map });
   });
