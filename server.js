@@ -13,7 +13,7 @@ const WEAPONS = {
   'M12 BREACH': { damage: 9, range: 190, spread: .34 }, 'DMR-7': { damage: 38, range: 440, spread: .035 },
   default: { damage: 16, range: 350, spread: .1 }
 };
-const players = new Map(), rooms = new Map(), rankedQueue = [];
+const players = new Map(), rooms = new Map(), rankedQueue = [], partyRooms = new Map();
 const memoryBoard = new Map();
 let supabaseReady = !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY);
 const authReady = !!(process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY && process.env.SUPABASE_SERVICE_ROLE_KEY);
@@ -106,6 +106,7 @@ async function finishMatch(room, reason = 'time', disconnectedId = null) {
 }
 function playerDisconnected(p) {
   removeFromQueue(p.id);
+  const party = partyRooms.get(p.partyCode); if (party) { party.members.delete(p.id); if (!party.members.size) partyRooms.delete(party.code); else { if (party.hostId === p.id) { const first = party.members.values().next().value; party.hostId = first.id; party.hostName = first.name; } io.to('party:'+party.code).emit('partyUpdate', { partyCode: party.code, host: party.hostName, members: [...party.members.values()] }); } }
   if (!p.roomCode) return;
   const room = rooms.get(p.roomCode); if (!room) return;
   if (room.status === 'playing') finishMatch(room, 'disconnect', p.id);
@@ -117,6 +118,47 @@ io.on('connection', socket => {
   const p = { id: socket.id, socket, userId: socket.authUser.id, name: authName, color: '#48d9d2', x: 1800, y: 1300, angle: 0, hp: 100, kills: 0, deaths: 0, roomCode: null };
   players.set(socket.id, p);
   socket.on('joinArena', data => { p.color = safeColor(data?.color); socket.emit('authenticated', { username: p.name }); });
+  // Invite currently connected players by exact username. 1v1 invitations create a private room;
+  // party invitations create a social lobby (party members can then coordinate before a match).
+  socket.on('inviteFriend', data => {
+    const targetName = safeText(data?.username, '', 18).toLowerCase();
+    const kind = data?.kind === 'party' ? 'party' : 'duel';
+    if (!targetName) return socket.emit('inviteError', 'Enter your friend’s username.');
+    if (targetName === p.name.toLowerCase()) return socket.emit('inviteError', 'You cannot invite yourself.');
+    const target = [...players.values()].find(x => x.name.toLowerCase() === targetName);
+    if (!target) return socket.emit('inviteError', 'That player is not connected to the online server right now. Ask them to connect first.');
+    if (kind === 'duel') {
+      if (p.roomCode) return socket.emit('inviteError', 'Leave your current match or room before inviting someone to a 1v1.');
+      const room = createRoom(p, data?.map, false);
+      target.socket.emit('gameInvite', { kind, from: p.name, roomCode: room.code, map: room.map, inviteId: crypto.randomUUID() });
+      socket.emit('inviteSent', { kind, username: target.name, roomCode: room.code, message: `1v1 invitation sent to ${target.name}. Waiting for them to accept.` });
+    } else {
+      let party = [...partyRooms.values()].find(x => x.hostId === p.id || x.members.has(p.id));
+      if (!party) { let partyCode = code(); while (partyRooms.has(partyCode)) partyCode = code(); party = { code: partyCode, hostId: p.id, hostName: p.name, members: new Map(), createdAt: Date.now() }; party.members.set(p.id, { id:p.id, name:p.name }); partyRooms.set(partyCode, party); p.partyCode = party.code; p.socket.join('party:'+party.code); }
+      if (party.members.size >= 4) return socket.emit('inviteError', 'Your party is full (maximum 4 players).');
+      target.socket.emit('gameInvite', { kind, from: p.name, partyCode: party.code, inviteId: crypto.randomUUID() });
+      socket.emit('inviteSent', { kind, username: target.name, partyCode: party.code, message: `Party invitation sent to ${target.name}.` });
+      socket.emit('partyUpdate', { partyCode: party.code, host: party.hostName, members: [...party.members.values()] });
+    }
+  });
+  socket.on('acceptGameInvite', data => {
+    const kind = data?.kind === 'party' ? 'party' : 'duel';
+    if (kind === 'duel') {
+      const room = rooms.get(String(data?.roomCode || '').trim().toUpperCase());
+      if (!room || room.ranked || room.status !== 'waiting') return socket.emit('inviteError', 'That 1v1 invitation has expired or the room is no longer available.');
+      if (p.roomCode) return socket.emit('inviteError', 'Leave your current room before accepting a 1v1 invitation.');
+      if (room.players.length !== 1) return socket.emit('inviteError', 'That 1v1 room is full.');
+      p.color = safeColor(data?.color); p.roomCode = room.code; p.socket.join(room.code); room.players.push(p);
+      io.to(room.code).emit('privateRoomUpdate', { roomCode: room.code, waiting: false, message: 'Invitation accepted. Starting 1v1…' }); startMatch(room);
+    } else {
+      const party = partyRooms.get(String(data?.partyCode || '').trim().toUpperCase());
+      if (!party) return socket.emit('inviteError', 'That party invitation has expired.');
+      if (party.members.size >= 4 && !party.members.has(p.id)) return socket.emit('inviteError', 'That party is full (maximum 4 players).');
+      party.members.set(p.id, { id:p.id, name:p.name }); p.partyCode = party.code; socket.join('party:'+party.code);
+      io.to('party:'+party.code).emit('partyUpdate', { partyCode: party.code, host: party.hostName, members: [...party.members.values()] });
+    }
+  });
+  socket.on('leaveParty', () => { const party = partyRooms.get(p.partyCode); if (party) { party.members.delete(p.id); socket.leave('party:'+party.code); if (!party.members.size) partyRooms.delete(party.code); else { if (party.hostId === p.id) { const first = party.members.values().next().value; party.hostId = first.id; party.hostName = first.name; } io.to('party:'+party.code).emit('partyUpdate', { partyCode: party.code, host: party.hostName, members: [...party.members.values()] }); } } p.partyCode = null; socket.emit('partyUpdate', { partyCode:null, host:null, members:[] }); });
   socket.on('move', data => {
     if (!data) return;
     p.color = safeColor(data.color);
