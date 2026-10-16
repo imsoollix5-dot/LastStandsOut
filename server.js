@@ -35,6 +35,19 @@ async function addFriendPair(a,b){if(!a||!b||a===b)return;const url=supabaseBase
 app.get('/api/profile', requireUser, async (req, res) => { try { let profile = await readProfile(req.authUser.id); if(!profile){await writeProfile(req.authUser,{});profile=await readProfile(req.authUser.id);} const ownerId=String(process.env.OWNER_USER_ID||'').trim();if(ownerId&&ownerId!==req.authUser.id)await addFriendPair(req.authUser.id,ownerId);res.json({ profile }); } catch (e) { console.error('Profile load failed:',e.message);res.status(500).json({ error: 'Could not load cloud profile.' }); } });
 app.get('/api/friends', requireUser, async (req,res)=>{try{const u=supabaseBase()+'/rest/v1/lsa_friends?user_id=eq.'+encodeURIComponent(req.authUser.id)+'&select=friend_id,created_at&order=created_at.asc';const r=await fetch(u,{headers:{apikey:process.env.SUPABASE_SERVICE_ROLE_KEY,Authorization:`Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`}});if(!r.ok)throw new Error('Friend list query failed');const links=await r.json();if(!links.length)return res.json({friends:[]});const ids=links.map(x=>x.friend_id).join(',');const pr=await fetch(supabaseBase()+'/rest/v1/lsa_profiles? id=in.('+ids+')&select=id,username,game_state'.replace('? id','?id'),{headers:{apikey:process.env.SUPABASE_SERVICE_ROLE_KEY,Authorization:`Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`}});if(!pr.ok)throw new Error('Friend profiles query failed');res.json({friends:await pr.json()});}catch(e){console.error('Friends load failed:',e.message);res.status(500).json({error:'Could not load friends.'})}});
 app.post('/api/friends', requireUser, async (req,res)=>{try{const username=safeText(req.body?.username,'',18);if(!username) return res.status(400).json({error:'Enter a username.'});const u=supabaseBase()+'/rest/v1/lsa_profiles?select=id,username&username=ilike.'+encodeURIComponent(username)+'&limit=1';const r=await fetch(u,{headers:{apikey:process.env.SUPABASE_SERVICE_ROLE_KEY,Authorization:`Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`}});if(!r.ok)throw new Error('Could not search players');const rows=await r.json();if(!rows.length)return res.status(404).json({error:'No account found with that username. They need to sign in at least once.'});if(rows[0].id===req.authUser.id)return res.status(400).json({error:'You cannot add yourself.'});await addFriendPair(req.authUser.id,rows[0].id);res.json({ok:true,username:rows[0].username});}catch(e){console.error('Add friend failed:',e.message);res.status(500).json({error:e.message||'Could not add friend.'})}});
+
+app.delete('/api/friends/:username', requireUser, async (req,res)=>{try{
+ const username=safeText(decodeURIComponent(req.params.username||''),'',18);
+ const q=supabaseBase()+'/rest/v1/lsa_profiles?select=id&username=ilike.'+encodeURIComponent(username)+'&limit=1';
+ const r=await fetch(q,{headers:{apikey:process.env.SUPABASE_SERVICE_ROLE_KEY,Authorization:`Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`}});
+ if(!r.ok)throw new Error('Could not find friend profile');const rows=await r.json();if(!rows.length)return res.status(404).json({error:'Friend not found.'});
+ const friendId=rows[0].id;const base=supabaseBase()+'/rest/v1/lsa_friends';
+ for(const url of [base+'?user_id=eq.'+encodeURIComponent(req.authUser.id)+'&friend_id=eq.'+encodeURIComponent(friendId),base+'?user_id=eq.'+encodeURIComponent(friendId)+'&friend_id=eq.'+encodeURIComponent(req.authUser.id)]){
+ const del=await fetch(url,{method:'DELETE',headers:{apikey:process.env.SUPABASE_SERVICE_ROLE_KEY,Authorization:`Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`}});
+ if(!del.ok)throw new Error('Could not remove friend connection.');
+ }res.json({ok:true});
+ }catch(e){console.error('Remove friend failed:',e.message);res.status(500).json({error:e.message||'Could not remove friend.'})}});
+
 app.put('/api/profile', requireUser, async (req, res) => { try { const state = req.body?.game_state; if (!state || typeof state !== 'object' || JSON.stringify(state).length > 200000) return res.status(400).json({ error: 'Invalid or too large profile.' }); const safeState = { ...state, name: safeText(req.authUser.user_metadata?.username || req.authUser.email?.split('@')[0] || 'PLAYER') }; await writeProfile(req.authUser, safeState); res.json({ ok: true }); } catch (e) { console.error('Cloud profile save failed:', e.message); res.status(500).json({ error: 'Could not save cloud profile.' }); } });
 function safeText(value, fallback = 'ROOKIE', max = 18) { return String(value || fallback).replace(/[^\w -]/g, '').trim().slice(0, max) || fallback; }
 function safeMap(value) { return MAPS.includes(value) ? value : 'foundry'; }
@@ -117,7 +130,11 @@ io.on('connection', socket => {
   const authName = safeText(socket.authUser.user_metadata?.username || socket.authUser.email?.split('@')[0] || 'PLAYER');
   const p = { id: socket.id, socket, userId: socket.authUser.id, name: authName, color: '#48d9d2', x: 1800, y: 1300, angle: 0, hp: 100, kills: 0, deaths: 0, roomCode: null };
   players.set(socket.id, p);
-  socket.on('joinArena', data => { p.color = safeColor(data?.color); socket.emit('authenticated', { username: p.name }); });
+  const broadcastOnlinePlayers = () => io.emit('onlinePlayersList', [...players.values()].map(x => ({ name: x.name })));
+  broadcastOnlinePlayers();
+  socket.on('joinArena', data => { p.color = safeColor(data?.color); socket.emit('authenticated', { username: p.name }); broadcastOnlinePlayers(); });
+  socket.on('requestOnlinePlayers', () => socket.emit('onlinePlayersList', [...players.values()].map(x => ({ name: x.name }))));
+  socket.on('leaveMatch', async () => { const room = rooms.get(p.roomCode); if (room) await finishMatch(room, 'forfeit', p.id); removeFromQueue(p.id); socket.emit('leaveMatchAck', { ok: true }); });
   // Invite currently connected players by exact username. 1v1 invitations create a private room;
   // party invitations create a social lobby (party members can then coordinate before a match).
   socket.on('inviteFriend', async data => {
@@ -203,6 +220,6 @@ io.on('connection', socket => {
     io.to(room.code).emit('playerStats', room.players.map(publicPlayer));
   });
   socket.on('getLeaderboard', async data => socket.emit('leaderboardData', { map: data?.map === 'all' ? 'all' : safeMap(data?.map), persistent: supabaseReady, rows: await getBoard(data?.map || 'all') }));
-  socket.on('disconnect', () => { playerDisconnected(p); players.delete(socket.id); });
+  socket.on('disconnect', () => { playerDisconnected(p); players.delete(socket.id); broadcastOnlinePlayers(); });
 });
 server.listen(PORT, '0.0.0.0', () => console.log(`LAST STAND ARENA server listening on ${PORT}`));
