@@ -24,7 +24,7 @@ async function readProfile(userId) { const url = supabaseBase() + '/rest/v1/lsa_
 async function writeProfile(user, gameState) { const username = safeText(user.user_metadata?.username || user.email?.split('@')[0] || 'PLAYER'); const body = { id: user.id, username, game_state: gameState, updated_at: new Date().toISOString() }; const r = await fetch(supabaseBase() + '/rest/v1/lsa_profiles?on_conflict=id', { method: 'POST', headers: { apikey: process.env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(body) }); if (!r.ok) throw new Error(`Profile write failed (${r.status})`); }
 
 app.use((req, res, next) => { res.setHeader('Access-Control-Allow-Origin', '*'); res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type'); res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS'); if (req.method === 'OPTIONS') return res.sendStatus(204); next(); });
-app.use(express.json({ limit: '16kb' }));
+app.use(express.json({ limit: '256kb' }));
 app.get('/', (_req, res) => res.status(200).send('LAST STAND ARENA multiplayer server is online.'));
 app.get('/health', (_req, res) => res.json({ ok: true, connected: players.size, activeMatches: [...rooms.values()].filter(r => r.status === 'playing').length, leaderboardStorage: supabaseReady ? 'supabase' : 'temporary-memory', accounts: authReady ? 'enabled' : 'not-configured' }));
 app.get('/api/config', (_req, res) => res.json({ authEnabled: authReady, supabaseUrl: authReady ? process.env.SUPABASE_URL : '', supabaseAnonKey: authReady ? process.env.SUPABASE_ANON_KEY : '' }));

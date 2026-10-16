@@ -19,3 +19,16 @@ create unique index if not exists lsa_profiles_username_lower_idx on public.lsa_
 alter table public.lsa_profiles enable row level security;
 -- Browser clients do not access these tables directly; the Render server uses its service-role key
 -- only after validating the user's Supabase access token. Do not add public policies for these tables.
+
+
+-- Friend links are stored in both directions so each player's list is easy to load.
+create table if not exists public.lsa_friends (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  friend_id uuid not null references auth.users(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (user_id, friend_id),
+  check (user_id <> friend_id)
+);
+create index if not exists lsa_friends_user_idx on public.lsa_friends (user_id, created_at);
+alter table public.lsa_friends enable row level security;
+-- Render server uses the service-role key; do not add public policies.
